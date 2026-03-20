@@ -72,6 +72,8 @@ When 2+ subtitle streams are selected and at least two are text-based, the tool 
 
 `prepare_merged_ass()` extracts each stream to a temp ASS via ffmpeg, merges them with `pysubs2`, and writes `<output_name>.bilingual.ass` alongside the output file at submission time (so it persists for delayed pueue jobs). The merged track is added as a second `-i` input, mapped last, flagged `default`, and titled `Bilingual (XX/YY)`. Original subtitle streams are copied unchanged.
 
+`merge_bilingual_ass()` creates a fresh `SSAFile` with explicitly defined `Learning` and `Reference` styles rather than modifying styles from the source files — source ASS streams extracted from MKV often use arbitrary style names and cannot be assumed to have a `Default` style.
+
 To re-mux an existing file without re-encoding, choose `copy` for video and audio — only the container is touched.
 
 ### Encoder defaults
