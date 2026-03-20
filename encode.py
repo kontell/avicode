@@ -5,6 +5,7 @@ import sys
 import re
 import os
 import glob
+import copy
 import shlex
 import shutil
 import argparse
@@ -14,6 +15,8 @@ DOVI_PYTHON = "/opt/dovi_convert/venv/bin/python"
 DOVI_SCRIPT = "/opt/dovi_convert/dovi_convert.py"
 BATCH_FILE = os.path.expanduser("~/.bin/batch-encode.sh")
 TARGET_DIR = "/media/bluecon/video/encode"
+
+IMAGE_SUBTITLE_CODECS = {'hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'}
 
 # -- Utils --
 def check_dependencies(use_pueue=True):
@@ -176,7 +179,8 @@ def print_stream_list(streams):
                 elif g == "subtitle":
                     default = "Yes" if s.get('disposition', {}).get('default') else "No"
                     forced = "Yes" if s.get('disposition', {}).get('forced') else "No"
-                    details = f"Def: {default} | Forced: {forced}"
+                    image = " [image-based]" if is_image_subtitle(s) else ""
+                    details = f"Def: {default} | Forced: {forced}{image}"
 
                 line = f"Index {idx:<3} [{lang}] {codec}"
                 if title: line += f" | {title}"
@@ -283,6 +287,84 @@ def submit_to_pueue(command, label, delay=None):
         print("Run 'pueue status' to view queue.")
     except Exception as e:
         print(f"Error submitting to pueue: {e}")
+
+# -- Subtitle Merge --
+def is_image_subtitle(stream):
+    return stream.get('codec_name', '').lower() in IMAGE_SUBTITLE_CODECS
+
+def extract_subtitle_to_ass(input_file, stream_index, output_path):
+    """Extract a single subtitle stream to ASS format using ffmpeg."""
+    cmd = [
+        "/usr/lib/jellyfin-ffmpeg/ffmpeg", "-y", "-v", "quiet",
+        "-i", input_file,
+        "-map", f"0:{stream_index}",
+        output_path
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, check=True)
+    except subprocess.CalledProcessError:
+        print(f"Error: Failed to extract subtitle stream {stream_index} to ASS.")
+        sys.exit(1)
+
+def merge_bilingual_ass(learning_ass, reference_ass, output_ass, learning_lang="", reference_lang=""):
+    """
+    Merge two ASS subtitle files into a single bilingual track.
+    Learning language: bottom centre, white (primary reading position).
+    Reference language: top centre, grey (glanceable fallback).
+    """
+    try:
+        import pysubs2
+    except ImportError:
+        print("Error: pysubs2 is required for subtitle merging.")
+        print("       Install with: pip install pysubs2")
+        sys.exit(1)
+
+    doc = pysubs2.load(learning_ass)
+    ref = pysubs2.load(reference_ass)
+
+    # Learning language — bottom centre, white
+    doc.styles["Default"].primarycolor = pysubs2.Color(255, 255, 255, 0)
+    doc.styles["Default"].alignment = 2   # numpad: bottom centre
+    doc.styles["Default"].marginv = 20
+
+    # Reference language — top centre, grey
+    ref_style = copy.copy(doc.styles["Default"])
+    ref_style.primarycolor = pysubs2.Color(200, 200, 200, 0)
+    ref_style.alignment = 8   # numpad: top centre
+    ref_style.marginv = 20
+    doc.styles["Reference"] = ref_style
+
+    for event in ref.events:
+        event.style = "Reference"
+
+    doc.events.extend(ref.events)
+    doc.sort()
+    doc.save(output_ass)
+
+def prepare_merged_ass(input_file, config, out_base):
+    """
+    Extract and merge subtitle streams to produce a bilingual ASS file.
+    out_base is the output path without extension; the .bilingual.ass file
+    is written there so it persists until the queued encode runs.
+    Returns the path to the merged ASS file.
+    """
+    mc = config['merge_config']
+    merged_path = out_base + '.bilingual.ass'
+    tmp_learning   = out_base + '.tmp_learning.ass'
+    tmp_reference  = out_base + '.tmp_reference.ass'
+
+    print("Preparing bilingual subtitle merge...")
+    print(f"   -> Extracting stream {mc['learning']} ({mc.get('learning_lang', '?')})...")
+    extract_subtitle_to_ass(input_file, mc['learning'], tmp_learning)
+    print(f"   -> Extracting stream {mc['reference']} ({mc.get('reference_lang', '?')})...")
+    extract_subtitle_to_ass(input_file, mc['reference'], tmp_reference)
+    print("   -> Merging...")
+    merge_bilingual_ass(tmp_learning, tmp_reference, merged_path,
+                        mc.get('learning_lang', ''), mc.get('reference_lang', ''))
+    os.unlink(tmp_learning)
+    os.unlink(tmp_reference)
+    print(f"   -> Written: {os.path.basename(merged_path)}")
+    return merged_path
 
 # -- Batch Consistency Check --
 def get_stream_signature(streams):
@@ -426,13 +508,17 @@ def build_encode_config(streams, input_file, args):
 
     # 5. Subtitles
     sub_flags = []
+    subtitle_count = 0
+    merge_config = None
     sub_streams = [s for s in streams if s['codec_type'] == 'subtitle']
+
     if sub_streams:
         s_indices = [s['index'] for s in sub_streams]
         sel = input(f"Select Subtitle Indices (e.g. {','.join(map(str, s_indices))} or 'none') [none]: ")
 
         if sel and sel.lower() != "none":
             sel_indices = [int(x) for x in sel.split(",") if x.strip().isdigit()]
+            subtitle_count = len(sel_indices)
             def_idx = sel_indices[0] if len(sel_indices) == 1 else None
 
             if len(sel_indices) > 1:
@@ -447,19 +533,57 @@ def build_encode_config(streams, input_file, args):
 
             sub_flags.extend(["-c:s", "copy"])
 
+            # Bilingual merge prompt — requires 2+ text-based streams
+            if len(sel_indices) >= 2:
+                text_subs = [
+                    idx for idx in sel_indices
+                    if not is_image_subtitle(next(s for s in streams if s['index'] == idx))
+                ]
+                if len(text_subs) >= 2:
+                    if input("Merge two subtitle streams into a bilingual ASS track? [y/N]: ").strip().lower() == 'y':
+                        print("  Text-based streams available:")
+                        for idx in text_subs:
+                            s = next(s for s in streams if s['index'] == idx)
+                            lang = s.get('tags', {}).get('language', 'und')
+                            print(f"    Index {idx} [{lang}] {s.get('codec_name', '')}")
+
+                        l_def = str(text_subs[0])
+                        r_def = str(text_subs[1])
+                        l_in = input(f"  Learning language stream — bottom, white [{l_def}]: ").strip() or l_def
+                        r_in = input(f"  Reference language stream — top, grey [{r_def}]: ").strip() or r_def
+
+                        if (l_in.isdigit() and r_in.isdigit()
+                                and int(l_in) in text_subs
+                                and int(r_in) in text_subs
+                                and l_in != r_in):
+                            l_idx, r_idx = int(l_in), int(r_in)
+                            l_lang = next(s for s in streams if s['index'] == l_idx).get('tags', {}).get('language', 'und')
+                            r_lang = next(s for s in streams if s['index'] == r_idx).get('tags', {}).get('language', 'und')
+                            merge_config = {
+                                'learning':      l_idx,
+                                'reference':     r_idx,
+                                'learning_lang':  l_lang,
+                                'reference_lang': r_lang,
+                            }
+                            print(f"  Bilingual track: {l_lang.upper()} (bottom) / {r_lang.upper()} (top)")
+                        else:
+                            print("  Invalid selection, skipping merge.")
+
     return {
-        'vid_params': vid_params,
-        'vid_meta': vid_meta,
-        'dv_flags': dv_flags,
-        'audio_flags': audio_flags,
-        'sub_flags': sub_flags,
-        'is_uhd': is_uhd,
+        'vid_params':     vid_params,
+        'vid_meta':       vid_meta,
+        'dv_flags':       dv_flags,
+        'audio_flags':    audio_flags,
+        'sub_flags':      sub_flags,
+        'subtitle_count': subtitle_count,
+        'merge_config':   merge_config,
+        'is_uhd':         is_uhd,
         'is_hdr10_source': is_hdr10_source,
-        'downscale': downscale,
+        'downscale':      downscale,
     }
 
 # -- FFmpeg Command Builder --
-def build_ffmpeg_command(input_path, output_path, config, args):
+def build_ffmpeg_command(input_path, output_path, config, args, merged_ass_path=None):
     """Construct the full FFmpeg command list from a config dict."""
     cmd = ["nice", "-n", "19", "ionice", "-c", "3", "/usr/lib/jellyfin-ffmpeg/ffmpeg"]
     cmd.extend(["-loglevel", "info"])
@@ -468,6 +592,8 @@ def build_ffmpeg_command(input_path, output_path, config, args):
         cmd.extend(["-ss", "00:02:00", "-t", "60"])
 
     cmd.extend(["-i", input_path])
+    if merged_ass_path:
+        cmd.extend(["-i", merged_ass_path])
 
     vf = []
     if config['downscale']:
@@ -481,8 +607,18 @@ def build_ffmpeg_command(input_path, output_path, config, args):
     cmd.extend(config['vid_meta'])
     cmd.extend(config['audio_flags'])
     cmd.extend(config['sub_flags'])
-    cmd.extend(["-map_metadata:g", "0:g", "-movflags", "+faststart", output_path])
 
+    if merged_ass_path:
+        mc = config.get('merge_config', {})
+        n = config.get('subtitle_count', 0)
+        l_lang = mc.get('learning_lang', '').upper()
+        r_lang = mc.get('reference_lang', '').upper()
+        title = f"Bilingual ({l_lang}/{r_lang})" if l_lang and r_lang else "Bilingual"
+        cmd.extend(["-map", "1:0"])
+        cmd.extend([f"-disposition:s:{n}", "default"])
+        cmd.extend([f"-metadata:s:s:{n}", f"title={title}"])
+
+    cmd.extend(["-map_metadata:g", "0:g", "-movflags", "+faststart", output_path])
     return cmd
 
 # -- Single File Mode --
@@ -522,7 +658,12 @@ def run_single_file(input_abspath, args):
     os.makedirs(os.path.dirname(out_abspath), exist_ok=True)
     out_abspath = os.path.abspath(out_abspath)
 
-    cmd = build_ffmpeg_command(ffmpeg_input, out_abspath, config, args)
+    merged_ass_path = None
+    if config.get('merge_config'):
+        out_base = os.path.splitext(out_abspath)[0]
+        merged_ass_path = prepare_merged_ass(ffmpeg_input, config, out_base)
+
+    cmd = build_ffmpeg_command(ffmpeg_input, out_abspath, config, args, merged_ass_path=merged_ass_path)
 
     if args.print:
         write_batch_command(cmd)
@@ -587,15 +728,20 @@ def run_batch(directory, args):
     # Queue each file
     dv_active = len(config['dv_flags']) > 0
     print(f"\nQueuing {len(mkv_files)} encode(s) to pueue...")
-    print("-" * 40)
 
     for input_file in mkv_files:
         out_name = generate_filename(input_file, config['is_uhd'], dv_active, config['is_hdr10_source'])
         if args.test:
             out_name = out_name.replace(".mkv", ".TEST.mkv")
         out_path = os.path.join(out_dir, out_name)
+        out_base = os.path.splitext(out_path)[0]
 
-        cmd = build_ffmpeg_command(input_file, out_path, config, args)
+        merged_ass_path = None
+        if config.get('merge_config'):
+            print(f"\n{os.path.basename(input_file)}:")
+            merged_ass_path = prepare_merged_ass(input_file, config, out_base)
+
+        cmd = build_ffmpeg_command(input_file, out_path, config, args, merged_ass_path=merged_ass_path)
         submit_to_pueue(cmd, os.path.basename(out_path))
 
     print(f"\nDone. {len(mkv_files)} job(s) queued.")
