@@ -9,10 +9,13 @@ This is a single-file Python 3 CLI tool (`encode.py`) for interactive video tran
 ## Running the Tool
 
 ```bash
-# Encode a video interactively
+# Encode a single video interactively
 python3 encode.py <input.mkv>
 
-# Append FFmpeg command to batch file instead of queuing
+# Batch mode — encode all .mkv files in a directory (e.g. a TV season)
+python3 encode.py <directory/>
+
+# Append FFmpeg command to batch file instead of queuing (single file only)
 python3 encode.py <input.mkv> --print
 
 # Create a 60-second test clip
@@ -38,12 +41,23 @@ These paths are hardcoded at the top of `encode.py` (lines 11–15) and must be 
 
 ## Architecture
 
-The script is structured as a single linear flow with grouped helper functions:
+`main()` dispatches to `run_single_file()` or `run_batch()` depending on whether the input path is a file or directory. Both modes share two core helpers:
 
-1. **Probe phase** — `get_ffprobe_info()`, `get_hdr_info()`, `scan_dovi_profile()`: reads stream metadata and detects HDR/Dolby Vision profile
-2. **Interactive configuration** — prompts for resolution, rate control mode (VBR vs CRF), audio stream selection, subtitle selection, and output filename
-3. **Command generation** — builds SVT-AV1 FFmpeg command with Opus audio; handles Dolby Vision Profile 7 FEL/MEL detection to set correct flags via `get_dv_flags()`
-4. **Output** — either appends to batch file (`--print`) or submits to pueue job queue via `submit_to_pueue()`
+- **`build_encode_config(streams, input_file, args)`** — runs all interactive prompts (resolution, DV/HDR, rate control, audio, subtitles) and returns a config dict
+- **`build_ffmpeg_command(input_path, output_path, config, args)`** — constructs the FFmpeg command list from a config dict
+
+### Single file flow
+1. Probe with `get_ffprobe_info()`, detect HDR/DV via `get_hdr_info()` / `get_dv_flags()`
+2. `build_encode_config()` — interactive prompts
+3. Prompt for output filename
+4. `build_ffmpeg_command()` → `write_batch_command()` (`--print`) or `submit_to_pueue()`
+
+### Batch flow
+1. Glob all `.mkv` files in the directory, probe each with ffprobe
+2. `check_stream_consistency()` compares audio/subtitle stream counts and languages against the first file; flags any per-file differences
+3. If inconsistent, show the report and reference stream list, then ask the user whether to continue
+4. `build_encode_config()` once (based on first file), then loop — `build_ffmpeg_command()` + `submit_to_pueue()` per episode
+5. Output filenames are auto-generated via `generate_filename()`, which detects `SxxExx` episode patterns
 
 ### Encoder defaults
 - Codec: `libsvtav1`, preset 6, GOP 240, B-frames 2
