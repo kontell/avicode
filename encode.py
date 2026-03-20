@@ -5,7 +5,6 @@ import sys
 import re
 import os
 import glob
-import copy
 import shlex
 import shutil
 import argparse
@@ -322,24 +321,36 @@ def merge_bilingual_ass(learning_ass, reference_ass, output_ass, learning_lang="
     doc = pysubs2.load(learning_ass)
     ref = pysubs2.load(reference_ass)
 
-    # Learning language — bottom centre, white
-    doc.styles["Default"].primarycolor = pysubs2.Color(255, 255, 255, 0)
-    doc.styles["Default"].alignment = 2   # numpad: bottom centre
-    doc.styles["Default"].marginv = 20
+    # Build styles from scratch — don't assume any particular style name exists
+    # in the source files (ASS extracted from MKV can use arbitrary style names).
+    learning_style = pysubs2.SSAStyle()
+    learning_style.fontname    = "Arial"
+    learning_style.fontsize    = 48
+    learning_style.primarycolor  = pysubs2.Color(255, 255, 255, 0)  # white
+    learning_style.outlinecolor  = pysubs2.Color(0, 0, 0, 0)        # black outline
+    learning_style.alignment   = 2   # numpad: bottom centre
+    learning_style.marginv     = 20
 
-    # Reference language — top centre, grey
-    ref_style = copy.copy(doc.styles["Default"])
-    ref_style.primarycolor = pysubs2.Color(200, 200, 200, 0)
-    ref_style.alignment = 8   # numpad: top centre
-    ref_style.marginv = 20
-    doc.styles["Reference"] = ref_style
+    reference_style = pysubs2.SSAStyle()
+    reference_style.fontname   = "Arial"
+    reference_style.fontsize   = 48
+    reference_style.primarycolor = pysubs2.Color(200, 200, 200, 0)  # light grey
+    reference_style.outlinecolor = pysubs2.Color(0, 0, 0, 0)        # black outline
+    reference_style.alignment  = 8   # numpad: top centre
+    reference_style.marginv    = 20
 
+    out = pysubs2.SSAFile()
+    out.styles["Learning"]  = learning_style
+    out.styles["Reference"] = reference_style
+
+    for event in doc.events:
+        event.style = "Learning"
     for event in ref.events:
         event.style = "Reference"
 
-    doc.events.extend(ref.events)
-    doc.sort()
-    doc.save(output_ass)
+    out.events = doc.events + ref.events
+    out.sort()
+    out.save(output_ass)
 
 def prepare_merged_ass(input_file, config, out_base):
     """
