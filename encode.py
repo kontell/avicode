@@ -452,6 +452,11 @@ def build_encode_config(streams, input_file, args):
 
     # 2. HDR / DV Status
     dv_flags = get_dv_flags(streams, input_file)
+    dv_profile = next(
+        (s.get("dv_profile") for s in (video_stream or {}).get("side_data_list", [])
+         if s.get("side_data_type") == "DOVI configuration record"),
+        None
+    )
     hdr_info_str = get_hdr_info(video_stream) if video_stream else ""
     is_hdr10_source = "HDR10" in hdr_info_str or "Mastering display metadata" in str(video_stream)
 
@@ -584,6 +589,7 @@ def build_encode_config(streams, input_file, args):
         'vid_params':     vid_params,
         'vid_meta':       vid_meta,
         'dv_flags':       dv_flags,
+        'dv_profile':     dv_profile,
         'audio_flags':    audio_flags,
         'sub_flags':      sub_flags,
         'subtitle_count': subtitle_count,
@@ -610,6 +616,8 @@ def build_ffmpeg_command(input_path, output_path, config, args, merged_ass_path=
     if config['downscale']:
         vf.append("scale=1920:-2:flags=lanczos")
     vf.append("format=yuv420p10le")
+    if config.get('dv_profile') == 5 and config.get('dv_flags'):
+        vf.append("setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv")
 
     cmd.extend(["-vf", ",".join(vf)])
     cmd.extend(config['vid_params'])
