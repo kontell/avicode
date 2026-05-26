@@ -10,8 +10,8 @@ import shutil
 import argparse
 
 # -- Configuration --
-DOVI_PYTHON = "/opt/dovi_convert/venv/bin/python"
-DOVI_SCRIPT = "/opt/dovi_convert/dovi_convert.py"
+DOVI_PYTHON = "/opt/avicode/venv/bin/python"
+DOVI_SCRIPT = "/opt/avicode/dovi_convert.py"
 BATCH_FILE = os.path.expanduser("~/.bin/batch-encode.sh")
 TARGET_DIR = "/media/bluecon/video/encode"
 
@@ -100,14 +100,14 @@ def scan_dovi_profile(input_file):
         return None
 
     print("   -> Invoking dovi_convert -scan ...")
-    cmd = [DOVI_PYTHON, DOVI_SCRIPT, "-scan", input_file]
+    cmd = [DOVI_PYTHON, DOVI_SCRIPT, "scan", input_file]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
         clean_output = strip_ansi_codes(result.stdout)
 
-        if "FEL" in clean_output:
-            print("   -> Detected FEL. Unsafe for Profile 8.1 conversion.")
+        if "FEL (Complex)" in clean_output:
+            print("   -> Detected Complex FEL. Unsafe for Profile 8.1 conversion.")
             return False
         if "MEL" in clean_output or "Action: CONVERT" in clean_output:
             return True
@@ -308,8 +308,8 @@ def extract_subtitle_to_ass(input_file, stream_index, output_path):
 def merge_bilingual_ass(learning_ass, reference_ass, output_ass, learning_lang="", reference_lang=""):
     """
     Merge two ASS subtitle files into a single bilingual track.
-    Learning language: bottom centre, white (primary reading position).
-    Reference language: top centre, grey (glanceable fallback).
+    Learning language: bottom right, white (primary reading position).
+    Reference language: bottom left, grey (glanceable fallback).
     """
     try:
         import pysubs2
@@ -325,28 +325,38 @@ def merge_bilingual_ass(learning_ass, reference_ass, output_ass, learning_lang="
     # in the source files (ASS extracted from MKV can use arbitrary style names).
     learning_style = pysubs2.SSAStyle()
     learning_style.fontname    = "Arial"
-    learning_style.fontsize    = 48
+    learning_style.fontsize    = 52
     learning_style.primarycolor  = pysubs2.Color(255, 255, 255, 0)  # white
     learning_style.outlinecolor  = pysubs2.Color(0, 0, 0, 0)        # black outline
-    learning_style.alignment   = 2   # numpad: bottom centre
-    learning_style.marginv     = 20
+    learning_style.alignment   = 2   # numpad: bottom centre (within right half)
+    learning_style.marginl     = 960
+    learning_style.marginr     = 0
+    learning_style.marginv     = 30
 
     reference_style = pysubs2.SSAStyle()
     reference_style.fontname   = "Arial"
-    reference_style.fontsize   = 48
+    reference_style.fontsize   = 44
     reference_style.primarycolor = pysubs2.Color(200, 200, 200, 0)  # light grey
     reference_style.outlinecolor = pysubs2.Color(0, 0, 0, 0)        # black outline
-    reference_style.alignment  = 8   # numpad: top centre
-    reference_style.marginv    = 20
+    reference_style.alignment  = 2   # numpad: bottom centre (within left half)
+    reference_style.marginl    = 0
+    reference_style.marginr    = 960
+    reference_style.marginv    = 30
 
     out = pysubs2.SSAFile()
+    out.info["PlayResX"] = "1920"
+    out.info["PlayResY"] = "1080"
     out.styles["Learning"]  = learning_style
     out.styles["Reference"] = reference_style
 
+    # Strip inline override tags (e.g. {\fs48\c&HFFFFFF&}) from source events so
+    # they don't override the Learning/Reference style definitions above.
     for event in doc.events:
         event.style = "Learning"
+        event.text  = re.sub(r'\{[^}]*\}', '', event.text)
     for event in ref.events:
         event.style = "Reference"
+        event.text  = re.sub(r'\{[^}]*\}', '', event.text)
 
     out.events = doc.events + ref.events
     out.sort()
@@ -361,8 +371,11 @@ def prepare_merged_ass(input_file, config, out_base):
     """
     mc = config['merge_config']
     merged_path = out_base + '.bilingual.ass'
-    tmp_learning   = out_base + '.tmp_learning.ass'
-    tmp_reference  = out_base + '.tmp_reference.ass'
+    tmp_dir = os.path.join(os.path.dirname(out_base), '.subtitle-tmp')
+    os.makedirs(tmp_dir, exist_ok=True)
+    base_name = os.path.basename(out_base)
+    tmp_learning  = os.path.join(tmp_dir, base_name + '.tmp_learning.ass')
+    tmp_reference = os.path.join(tmp_dir, base_name + '.tmp_reference.ass')
 
     print("Preparing bilingual subtitle merge...")
     print(f"   -> Extracting stream {mc['learning']} ({mc.get('learning_lang', '?')})...")
@@ -461,24 +474,28 @@ def build_encode_config(streams, input_file, args):
     is_hdr10_source = "HDR10" in hdr_info_str or "Mastering display metadata" in str(video_stream)
 
     # 3. Rate Control
-    rc_input = input("Rate Control: (V)BR or (C)RF? [VBR]: ").strip().upper()
-    rc_mode = rc_input if rc_input in ("V", "C") else "V"
+    rc_input = input("Rate Control: (V)BR, (C)RF, or (P)assthrough/copy? [VBR]: ").strip().upper()
+    rc_mode = rc_input if rc_input in ("V", "C", "P") else "V"
 
-    vid_params = ["-c:v", "libsvtav1", "-preset", "6", "-g", "240", "-bf", "2"]
     vid_meta = []
 
-    if rc_mode == "C":
-        crf = input("Enter CRF value [24]: ").strip() or "24"
-        vid_params.extend(["-crf", crf])
+    if rc_mode == "P":
+        vid_params = ["-c:v", "copy"]
+        dv_flags = []
     else:
-        default_bitrate = "20000k" if is_uhd else "4500k"
-        bitrate = input(f"Enter target VBR bitrate [{default_bitrate}]: ").strip() or default_bitrate
-        vid_params.extend(["-rc", "1", "-b:v", bitrate])
-        try:
-            bps_val = str(int(bitrate.lower().replace("k", "")) * 1000)
-            vid_meta.extend(["-metadata:s:v:0", f"BPS={bps_val}"])
-        except ValueError:
-            pass
+        vid_params = ["-c:v", "libsvtav1", "-preset", "6", "-g", "240", "-bf", "2"]
+        if rc_mode == "C":
+            crf = input("Enter CRF value [24]: ").strip() or "24"
+            vid_params.extend(["-crf", crf])
+        else:
+            default_bitrate = "20000k" if is_uhd else "4500k"
+            bitrate = input(f"Enter target VBR bitrate [{default_bitrate}]: ").strip() or default_bitrate
+            vid_params.extend(["-rc", "1", "-b:v", bitrate])
+            try:
+                bps_val = str(int(bitrate.lower().replace("k", "")) * 1000)
+                vid_meta.extend(["-metadata:s:v:0", f"BPS={bps_val}"])
+            except ValueError:
+                pass
 
     # 4. Audio
     audio_flags = []
@@ -565,8 +582,8 @@ def build_encode_config(streams, input_file, args):
 
                         l_def = str(text_subs[0])
                         r_def = str(text_subs[1])
-                        l_in = input(f"  Learning language stream — bottom, white [{l_def}]: ").strip() or l_def
-                        r_in = input(f"  Reference language stream — top, grey [{r_def}]: ").strip() or r_def
+                        l_in = input(f"  Learning language stream — right, white [{l_def}]: ").strip() or l_def
+                        r_in = input(f"  Reference language stream — left, grey [{r_def}]: ").strip() or r_def
 
                         if (l_in.isdigit() and r_in.isdigit()
                                 and int(l_in) in text_subs
@@ -581,7 +598,7 @@ def build_encode_config(streams, input_file, args):
                                 'learning_lang':  l_lang,
                                 'reference_lang': r_lang,
                             }
-                            print(f"  Bilingual track: {l_lang.upper()} (bottom) / {r_lang.upper()} (top)")
+                            print(f"  Bilingual track: {l_lang.upper()} (right) / {r_lang.upper()} (left)")
                         else:
                             print("  Invalid selection, skipping merge.")
 
@@ -612,14 +629,16 @@ def build_ffmpeg_command(input_path, output_path, config, args, merged_ass_path=
     if merged_ass_path:
         cmd.extend(["-i", merged_ass_path])
 
-    vf = []
-    if config['downscale']:
-        vf.append("scale=1920:-2:flags=lanczos")
-    vf.append("format=yuv420p10le")
-    if config.get('dv_profile') == 5 and config.get('dv_flags'):
-        vf.append("setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv")
+    is_copy = config['vid_params'] == ["-c:v", "copy"]
+    if not is_copy:
+        vf = []
+        if config['downscale']:
+            vf.append("scale=1920:-2:flags=lanczos")
+        vf.append("format=yuv420p10le")
+        if config.get('dv_profile') == 5 and config.get('dv_flags'):
+            vf.append("setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv")
+        cmd.extend(["-vf", ",".join(vf)])
 
-    cmd.extend(["-vf", ",".join(vf)])
     cmd.extend(config['vid_params'])
     cmd.extend(config['dv_flags'])
     cmd.extend(["-map", "0:v:0"])
